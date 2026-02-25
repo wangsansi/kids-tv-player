@@ -20,7 +20,7 @@ const LEGO_COLORS = [
 
 const videoRef = ref(null);
 const activeChannel = ref(1);
-const isPowerOn = ref(true);
+const isPowerOn = ref(false);
 const settingsVisible = ref(false);
 const challengeVisible = ref(false);
 const challengeInput = ref("");
