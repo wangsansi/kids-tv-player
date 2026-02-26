@@ -1,10 +1,19 @@
 <script setup>
-import { computed, nextTick, onMounted, reactive, ref, watch } from "vue";
+import {
+  computed,
+  nextTick,
+  onMounted,
+  onUnmounted,
+  reactive,
+  ref,
+  watch,
+} from "vue";
 import { message } from "ant-design-vue";
 import { defaultChannelUrls } from "./data/defaultChannels";
 
-const STORAGE_KEY = "kids-tv-player-state-v1";
+const STORAGE_KEY = "kids-tv-player-state-v2";
 const CHANNEL_COUNT = 10;
+const VIDEO_EXTENSIONS = [".mp4", ".m4v", ".webm", ".mov", ".mkv"];
 const LEGO_COLORS = [
   "#ff4d4f",
   "#fa8c16",
@@ -24,6 +33,9 @@ const isPowerOn = ref(false);
 const settingsVisible = ref(false);
 const challengeVisible = ref(false);
 const internalSeeking = ref(false);
+const isEpisodeTransitioning = ref(false);
+const pendingMetadataOnceHandler = ref(null);
+const pendingLoadedDataOnceHandler = ref(null);
 const screenFrameRef = ref(null);
 const videoDuration = ref(0);
 const isFullscreen = ref(false);
@@ -35,11 +47,15 @@ const challengeState = reactive({
   answer: 0,
 });
 
+const runtimeSeriesMap = reactive({});
+
 const state = reactive({
   channelUrls: [...defaultChannelUrls],
   progressMap: {},
+  seriesMetaMap: {},
   playback: {
     volume: 0.7,
+    bigKidMode: false,
   },
 });
 
@@ -47,10 +63,41 @@ const channelItems = computed(() =>
   Array.from({ length: CHANNEL_COUNT }, (_, i) => ({
     id: i + 1,
     color: LEGO_COLORS[i % LEGO_COLORS.length],
-  })),
+  }))
 );
 
-const currentUrl = computed(() => state.channelUrls[activeChannel.value - 1] || "");
+const currentSeriesRuntime = computed(
+  () => runtimeSeriesMap[activeChannel.value] || null
+);
+const currentSeriesMeta = computed(
+  () => state.seriesMetaMap[activeChannel.value] || null
+);
+const currentEpisodeIndex = computed(() =>
+  Math.max(Number(currentSeriesMeta.value?.currentEpisodeIndex || 0), 0)
+);
+
+const currentUrl = computed(() => {
+  if (currentSeriesRuntime.value?.episodes?.length) {
+    return (
+      currentSeriesRuntime.value.episodes[currentEpisodeIndex.value]?.url || ""
+    );
+  }
+  return state.channelUrls[activeChannel.value - 1] || "";
+});
+
+const currentPlaybackTime = computed(() => {
+  if (currentSeriesMeta.value) {
+    return Number(currentSeriesMeta.value.currentEpisodeTime || 0);
+  }
+  return Number(state.progressMap[activeChannel.value] || 0);
+});
+
+const currentEpisodeLabel = computed(() => {
+  if (!currentSeriesMeta.value) return "";
+  const episodeName =
+    currentSeriesMeta.value.episodeNames?.[currentEpisodeIndex.value] || "";
+  return `第 ${currentEpisodeIndex.value + 1} 集 ${episodeName}`;
+});
 
 function formatTime(seconds) {
   const safe = Number.isFinite(seconds) ? Math.floor(seconds) : 0;
@@ -59,10 +106,39 @@ function formatTime(seconds) {
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 
+function normalizeSeriesMeta(meta) {
+  if (!meta || typeof meta !== "object") return null;
+  const episodeNames = Array.isArray(meta.episodeNames)
+    ? meta.episodeNames.filter((item) => typeof item === "string")
+    : [];
+  if (!episodeNames.length) return null;
+
+  const currentEpisodeIndex = Math.min(
+    Math.max(Number(meta.currentEpisodeIndex || 0), 0),
+    episodeNames.length - 1
+  );
+  const legacyProgress =
+    meta.episodeProgress && typeof meta.episodeProgress === "object"
+      ? Number(meta.episodeProgress[currentEpisodeIndex] || 0)
+      : 0;
+  const currentEpisodeTime = Number.isFinite(meta.currentEpisodeTime)
+    ? Math.max(Number(meta.currentEpisodeTime), 0)
+    : Math.max(legacyProgress, 0);
+
+  return {
+    seriesName:
+      typeof meta.seriesName === "string" ? meta.seriesName : "未命名节目",
+    episodeNames,
+    currentEpisodeIndex,
+    currentEpisodeTime,
+  };
+}
+
 function persistState() {
   const payload = {
     channelUrls: state.channelUrls,
     progressMap: state.progressMap,
+    seriesMetaMap: state.seriesMetaMap,
     playback: state.playback,
   };
   localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
@@ -73,15 +149,34 @@ function loadState() {
   if (!raw) return;
   try {
     const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed.channelUrls) && parsed.channelUrls.length === CHANNEL_COUNT) {
-      state.channelUrls = parsed.channelUrls.map((url) => (typeof url === "string" ? url : ""));
+    if (
+      Array.isArray(parsed.channelUrls) &&
+      parsed.channelUrls.length === CHANNEL_COUNT
+    ) {
+      state.channelUrls = parsed.channelUrls.map((url) =>
+        typeof url === "string" ? url : ""
+      );
     }
     if (parsed.progressMap && typeof parsed.progressMap === "object") {
       state.progressMap = parsed.progressMap;
     }
+    if (parsed.seriesMetaMap && typeof parsed.seriesMetaMap === "object") {
+      const normalized = {};
+      Object.entries(parsed.seriesMetaMap).forEach(([channelId, meta]) => {
+        const valid = normalizeSeriesMeta(meta);
+        if (valid) normalized[channelId] = valid;
+      });
+      state.seriesMetaMap = normalized;
+    }
     if (parsed.playback && typeof parsed.playback === "object") {
       if (Number.isFinite(parsed.playback.volume)) {
-        state.playback.volume = Math.min(Math.max(Number(parsed.playback.volume), 0), 1);
+        state.playback.volume = Math.min(
+          Math.max(Number(parsed.playback.volume), 0),
+          1
+        );
+      }
+      if (typeof parsed.playback.bigKidMode === "boolean") {
+        state.playback.bigKidMode = parsed.playback.bigKidMode;
       }
     }
   } catch (_error) {
@@ -124,10 +219,139 @@ function verifyChallenge() {
   challengeError.value = "答案不对，再想一想哦。";
 }
 
+function releaseSeriesUrls(channelId) {
+  const runtime = runtimeSeriesMap[channelId];
+  if (!runtime?.episodes?.length) return;
+  runtime.episodes.forEach((episode) => URL.revokeObjectURL(episode.url));
+  delete runtimeSeriesMap[channelId];
+}
+
+function extractEpisodeNo(fileName) {
+  const rules = [/第\s*(\d+)\s*[集话]/i, /(?:ep|e)\s*0*(\d+)/i, /(\d{1,4})/i];
+  for (const regex of rules) {
+    const match = fileName.match(regex);
+    if (match?.[1]) return Number(match[1]);
+  }
+  return null;
+}
+
+function isVideoFile(fileName) {
+  const lower = fileName.toLowerCase();
+  return VIDEO_EXTENSIONS.some((ext) => lower.endsWith(ext));
+}
+
+function naturalNameCompare(a, b) {
+  return a.localeCompare(b, "zh-Hans-CN", {
+    numeric: true,
+    sensitivity: "base",
+  });
+}
+
+async function bindSeriesFolder(channelId) {
+  if (!window.showDirectoryPicker) {
+    message.error("当前浏览器不支持文件夹选择，请使用 Chrome/Edge。");
+    return;
+  }
+  try {
+    const dirHandle = await window.showDirectoryPicker();
+
+    const episodesRaw = [];
+    for await (const entry of dirHandle.values()) {
+      if (entry.kind !== "file") continue;
+      if (!isVideoFile(entry.name)) continue;
+      const file = await entry.getFile();
+      episodesRaw.push({
+        name: file.name,
+        episodeNo: extractEpisodeNo(file.name),
+        url: URL.createObjectURL(file),
+      });
+    }
+
+    if (!episodesRaw.length) {
+      message.warning("该文件夹没有可识别的视频文件。");
+      return;
+    }
+
+    episodesRaw.sort((a, b) => {
+      const aHasNo = Number.isFinite(a.episodeNo);
+      const bHasNo = Number.isFinite(b.episodeNo);
+      if (aHasNo && bHasNo) return a.episodeNo - b.episodeNo;
+      if (aHasNo) return -1;
+      if (bHasNo) return 1;
+      return naturalNameCompare(a.name, b.name);
+    });
+
+    releaseSeriesUrls(channelId);
+    runtimeSeriesMap[channelId] = { episodes: episodesRaw };
+
+    const previousMeta = state.seriesMetaMap[channelId];
+    const episodeNames = episodesRaw.map((item) => item.name);
+    const sameSeries =
+      previousMeta?.seriesName === (dirHandle.name || `频道 ${channelId}`);
+    const currentEpisodeIndex = sameSeries
+      ? Math.min(
+          Math.max(Number(previousMeta?.currentEpisodeIndex || 0), 0),
+          episodeNames.length - 1
+        )
+      : 0;
+    const currentEpisodeTime = sameSeries
+      ? Math.max(Number(previousMeta?.currentEpisodeTime || 0), 0)
+      : 0;
+
+    state.seriesMetaMap[channelId] = {
+      seriesName: dirHandle.name || `频道 ${channelId}`,
+      episodeNames,
+      currentEpisodeIndex,
+      currentEpisodeTime,
+    };
+    persistState();
+    message.success(
+      `${channelId} 号台已绑定：${dirHandle.name}（${episodeNames.length} 集）`
+    );
+
+    if (channelId === activeChannel.value) {
+      await nextTick();
+      videoDuration.value = 0;
+      restoreProgressForCurrentChannel();
+    }
+  } catch (error) {
+    if (error?.name === "AbortError") return;
+    message.error("绑定文件夹失败，请重试。");
+  }
+}
+
+function clearSeries(channelId) {
+  releaseSeriesUrls(channelId);
+  delete state.seriesMetaMap[channelId];
+  persistState();
+  message.success(`已清空 ${channelId} 号台剧集绑定`);
+}
+
+function getChannelSavedProgress(channelId) {
+  const seriesMeta = state.seriesMetaMap[channelId];
+  const runtime = runtimeSeriesMap[channelId];
+  if (seriesMeta && runtime?.episodes?.length) {
+    return Number(seriesMeta.currentEpisodeTime || 0);
+  }
+  return Number(state.progressMap[channelId] || 0);
+}
+
+function getChannelProgressForDisplay(channelId) {
+  return getChannelSavedProgress(channelId);
+}
+
 function saveCurrentProgress() {
   const video = videoRef.value;
   if (!video) return;
-  state.progressMap[activeChannel.value] = video.currentTime || 0;
+  const channelId = activeChannel.value;
+  const seriesMeta = state.seriesMetaMap[channelId];
+  const runtime = runtimeSeriesMap[channelId];
+
+  if (seriesMeta && runtime?.episodes?.length) {
+    seriesMeta.currentEpisodeTime = video.currentTime || 0;
+  } else {
+    state.progressMap[channelId] = video.currentTime || 0;
+  }
   persistState();
 }
 
@@ -148,22 +372,37 @@ function tryAutoplayCurrent() {
   }
 }
 
+function clearPendingMetadataListener(video) {
+  if (!video || !pendingMetadataOnceHandler.value) return;
+  video.removeEventListener("loadedmetadata", pendingMetadataOnceHandler.value);
+  pendingMetadataOnceHandler.value = null;
+}
+
+function clearPendingLoadedDataListener(video) {
+  if (!video || !pendingLoadedDataOnceHandler.value) return;
+  video.removeEventListener("loadeddata", pendingLoadedDataOnceHandler.value);
+  pendingLoadedDataOnceHandler.value = null;
+}
+
 function forceSeekToSavedProgress() {
   const video = videoRef.value;
   if (!video) return;
-  const saved = Number(state.progressMap[activeChannel.value] || 0);
+  clearPendingMetadataListener(video);
+  const saved = getChannelSavedProgress(activeChannel.value);
   if (saved <= 0) return;
 
-  // 开机兜底：先立即 seek 一次，再在元数据就绪后再 seek 一次，避免回到 00:00。
   internalSeeking.value = true;
   video.currentTime = saved;
   const onMetadata = () => {
-    const maxTime = Number.isFinite(video.duration) ? Math.max(video.duration - 1, 0) : saved;
+    const maxTime = Number.isFinite(video.duration)
+      ? Math.max(video.duration - 1, 0)
+      : saved;
     video.currentTime = Math.min(saved, maxTime);
     window.setTimeout(() => {
       internalSeeking.value = false;
     }, 0);
   };
+  pendingMetadataOnceHandler.value = onMetadata;
   video.addEventListener("loadedmetadata", onMetadata, { once: true });
 }
 
@@ -184,19 +423,30 @@ function setPower(checked) {
 function restoreProgressForCurrentChannel() {
   const video = videoRef.value;
   if (!video || !currentUrl.value) return;
-  const saved = Number(state.progressMap[activeChannel.value] || 0);
+  clearPendingMetadataListener(video);
+  clearPendingLoadedDataListener(video);
+  const saved = getChannelSavedProgress(activeChannel.value);
+
   if (saved <= 0) {
     if (isPowerOn.value) {
       if (video.readyState >= 2) {
         tryAutoplayCurrent();
       } else {
-        video.addEventListener("loadeddata", tryAutoplayCurrent, { once: true });
+        const onLoadedData = () => {
+          pendingLoadedDataOnceHandler.value = null;
+          tryAutoplayCurrent();
+        };
+        pendingLoadedDataOnceHandler.value = onLoadedData;
+        video.addEventListener("loadeddata", onLoadedData, { once: true });
       }
     }
     return;
   }
+
   const applyRestore = () => {
-    const maxTime = Number.isFinite(video.duration) ? Math.max(video.duration - 1, 0) : saved;
+    const maxTime = Number.isFinite(video.duration)
+      ? Math.max(video.duration - 1, 0)
+      : saved;
     internalSeeking.value = true;
     video.currentTime = Math.min(saved, maxTime);
     if (isPowerOn.value) {
@@ -206,18 +456,25 @@ function restoreProgressForCurrentChannel() {
       internalSeeking.value = false;
     }, 0);
   };
+
   if (video.readyState >= 1) {
     applyRestore();
   } else {
-    video.addEventListener("loadedmetadata", applyRestore, { once: true });
+    const onMetadata = () => {
+      pendingMetadataOnceHandler.value = null;
+      applyRestore();
+    };
+    pendingMetadataOnceHandler.value = onMetadata;
+    video.addEventListener("loadedmetadata", onMetadata, { once: true });
   }
 }
 
 function onTimeUpdate() {
   const video = videoRef.value;
   if (!video) return;
-  state.progressMap[activeChannel.value] = video.currentTime || 0;
-  persistState();
+  if (video.ended) return;
+  if (isEpisodeTransitioning.value) return;
+  saveCurrentProgress();
 }
 
 function onLoadedMetadata() {
@@ -261,12 +518,38 @@ function onFullscreenChange() {
 }
 
 function onVideoEnded() {
-  state.progressMap[activeChannel.value] = 0;
+  const channelId = activeChannel.value;
+  const seriesMeta = state.seriesMetaMap[channelId];
+  const runtime = runtimeSeriesMap[channelId];
+  if (seriesMeta && runtime?.episodes?.length) {
+    const idx = Math.max(Number(seriesMeta.currentEpisodeIndex || 0), 0);
+    seriesMeta.currentEpisodeTime = 0;
+    if (idx < runtime.episodes.length - 1) {
+      isEpisodeTransitioning.value = true;
+      seriesMeta.currentEpisodeIndex = idx + 1;
+      seriesMeta.currentEpisodeTime = 0;
+      persistState();
+      nextTick(() => {
+        videoDuration.value = 0;
+        restoreProgressForCurrentChannel();
+      });
+      return;
+    }
+    persistState();
+    return;
+  }
+
+  state.progressMap[channelId] = 0;
   persistState();
 }
 
 function resetProgress(channelId) {
   state.progressMap[channelId] = 0;
+  const seriesMeta = state.seriesMetaMap[channelId];
+  if (seriesMeta?.episodeNames?.length) {
+    seriesMeta.currentEpisodeIndex = 0;
+    seriesMeta.currentEpisodeTime = 0;
+  }
   if (channelId === activeChannel.value && videoRef.value) {
     videoRef.value.currentTime = 0;
   }
@@ -279,13 +562,24 @@ watch(
   () => {
     persistState();
   },
-  { deep: true },
+  { deep: true }
+);
+
+watch(
+  () => state.seriesMetaMap,
+  () => {
+    persistState();
+  },
+  { deep: true }
 );
 
 watch(currentUrl, async () => {
   await nextTick();
   videoDuration.value = 0;
   restoreProgressForCurrentChannel();
+  window.setTimeout(() => {
+    isEpisodeTransitioning.value = false;
+  }, 200);
 });
 
 watch(
@@ -294,7 +588,7 @@ watch(
     persistState();
     applyVolume(state.playback.volume);
   },
-  { deep: true },
+  { deep: true }
 );
 
 onMounted(() => {
@@ -307,6 +601,15 @@ onMounted(() => {
     tryAutoplayCurrent();
   });
 });
+
+onUnmounted(() => {
+  document.removeEventListener("fullscreenchange", onFullscreenChange);
+  clearPendingMetadataListener(videoRef.value);
+  clearPendingLoadedDataListener(videoRef.value);
+  Object.keys(runtimeSeriesMap).forEach((channelId) => {
+    releaseSeriesUrls(channelId);
+  });
+});
 </script>
 
 <template>
@@ -317,17 +620,30 @@ onMounted(() => {
           <video
             ref="videoRef"
             class="player"
+            :controls="state.playback.bigKidMode"
             :autoplay="isPowerOn"
             :src="currentUrl"
             @timeupdate="onTimeUpdate"
             @loadedmetadata="onLoadedMetadata"
             @ended="onVideoEnded"
           />
-          <div v-if="isPowerOn" class="screen-overlay-controls">
+          <div
+            v-if="isPowerOn && !state.playback.bigKidMode"
+            class="screen-overlay-controls"
+          >
+            <span v-if="currentEpisodeLabel" class="episode-chip">{{
+              currentEpisodeLabel
+            }}</span>
             <span class="time-chip">
-              {{ formatTime(state.progressMap[activeChannel] || 0) }}/{{ formatTime(videoDuration) }}
+              {{ formatTime(currentPlaybackTime) }}/{{
+                formatTime(videoDuration)
+              }}
             </span>
-            <button class="fullscreen-chip" type="button" @click="toggleFullscreen">
+            <button
+              class="fullscreen-chip"
+              type="button"
+              @click="toggleFullscreen"
+            >
               {{ isFullscreen ? "退出全屏" : "全屏" }}
             </button>
           </div>
@@ -337,8 +653,8 @@ onMounted(() => {
           </div>
         </template>
         <div v-else class="empty-screen">
-          <div>当前频道还没有视频</div>
-          <div>请进入家长模式添加链接</div>
+          <div>当前频道暂无可播放内容</div>
+          <div>请在家长设置中填写链接或绑定本地文件夹</div>
         </div>
       </div>
 
@@ -357,9 +673,13 @@ onMounted(() => {
           </button>
         </div>
         <div class="volume-wrap">
-          <button class="volume-btn" type="button" @click="decreaseVolume">-</button>
+          <button class="volume-btn" type="button" @click="decreaseVolume">
+            -
+          </button>
           <div class="volume-display">VOL {{ volumeLevel }}</div>
-          <button class="volume-btn" type="button" @click="increaseVolume">+</button>
+          <button class="volume-btn" type="button" @click="increaseVolume">
+            +
+          </button>
         </div>
         <div class="channel-board-on-tv">
           <button
@@ -371,10 +691,17 @@ onMounted(() => {
             @click="switchChannel(item.id)"
           >
             {{ item.id }}
-            <span class="progress-tag">{{ formatTime(state.progressMap[item.id] || 0) }}</span>
+            <span class="progress-tag">{{
+              formatTime(getChannelProgressForDisplay(item.id))
+            }}</span>
           </button>
         </div>
-        <button class="parent-icon-btn" type="button" aria-label="家长设置" @click="openChallenge">
+        <button
+          class="parent-icon-btn"
+          type="button"
+          aria-label="家长设置"
+          @click="openChallenge"
+        >
           ⚙
         </button>
       </aside>
@@ -401,19 +728,45 @@ onMounted(() => {
   <a-drawer
     v-model:open="settingsVisible"
     title="家长模式 - 频道设置"
-    width="620"
+    width="700"
     :destroy-on-close="false"
   >
     <div class="setting-desc">
-      每个频道填写一个可直接播放的视频链接（mp4、m3u8 或浏览器可播放格式）。
+      每个频道可配置在线视频链接，也可绑定本地动画文件夹（Chromium
+      浏览器可用）。
     </div>
-    <div v-for="item in channelItems" :key="`setting-${item.id}`" class="setting-row">
-      <div class="setting-label">{{ item.id }} 号台</div>
-      <a-input
-        v-model:value="state.channelUrls[item.id - 1]"
-        :placeholder="`请输入 ${item.id} 号台视频链接`"
-      />
-      <a-button danger @click="resetProgress(item.id)">清空进度</a-button>
+    <div class="playback-setting-row">
+      <span>大童模式（显示播放器 controls）</span>
+      <a-switch v-model:checked="state.playback.bigKidMode" />
+    </div>
+    <div
+      v-for="item in channelItems"
+      :key="`setting-${item.id}`"
+      class="setting-block"
+    >
+      <div class="setting-row">
+        <div class="setting-label">{{ item.id }} 号台</div>
+        <a-input
+          v-model:value="state.channelUrls[item.id - 1]"
+          :placeholder="`请输入 ${item.id} 号台视频链接`"
+        />
+        <a-button danger @click="resetProgress(item.id)">清空进度</a-button>
+      </div>
+      <div class="series-row">
+        <a-button @click="bindSeriesFolder(item.id)">绑定本地文件夹</a-button>
+        <span class="series-meta" v-if="state.seriesMetaMap[item.id]">
+          {{ state.seriesMetaMap[item.id].seriesName }} ·
+          {{ state.seriesMetaMap[item.id].episodeNames.length }} 集 · 当前第
+          {{ state.seriesMetaMap[item.id].currentEpisodeIndex + 1 }} 集
+        </span>
+        <a-button
+          v-if="state.seriesMetaMap[item.id]"
+          danger
+          @click="clearSeries(item.id)"
+        >
+          清空剧集
+        </a-button>
+      </div>
     </div>
   </a-drawer>
 </template>

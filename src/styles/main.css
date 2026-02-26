@@ -69,6 +69,19 @@ body {
   border-radius: 999px;
 }
 
+.episode-chip {
+  font-size: 12px;
+  font-weight: 700;
+  color: #ffe58f;
+  background: rgba(0, 0, 0, 0.55);
+  padding: 4px 8px;
+  border-radius: 999px;
+  max-width: 260px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .fullscreen-chip {
   border: none;
   background: rgba(0, 0, 0, 0.65);
@@ -294,12 +307,41 @@ body {
   color: #8c8c8c;
 }
 
+.playback-setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border: 1px solid #f0f0f0;
+  border-radius: 10px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  background: #fafafa;
+}
+
+.setting-block {
+  border-bottom: 1px solid #f0f0f0;
+  margin-bottom: 10px;
+  padding-bottom: 10px;
+}
+
 .setting-row {
   display: grid;
   grid-template-columns: 86px 1fr 96px;
   gap: 8px;
   align-items: center;
-  margin-bottom: 8px;
+  margin-bottom: 6px;
+}
+
+.series-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: 94px;
+}
+
+.series-meta {
+  color: #595959;
+  font-size: 12px;
 }
 
 .setting-label {
@@ -325,5 +367,10 @@ body {
 
   .control-panel {
     gap: 12px;
+  }
+
+  .series-row {
+    margin-left: 0;
+    flex-wrap: wrap;
   }
 }
