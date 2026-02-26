@@ -23,6 +23,11 @@ const activeChannel = ref(1);
 const isPowerOn = ref(false);
 const settingsVisible = ref(false);
 const challengeVisible = ref(false);
+const internalSeeking = ref(false);
+const screenFrameRef = ref(null);
+const videoDuration = ref(0);
+const isFullscreen = ref(false);
+const volumeLevel = ref(70);
 const challengeInput = ref("");
 const challengeError = ref("");
 const challengeState = reactive({
@@ -33,6 +38,9 @@ const challengeState = reactive({
 const state = reactive({
   channelUrls: [...defaultChannelUrls],
   progressMap: {},
+  playback: {
+    volume: 0.7,
+  },
 });
 
 const channelItems = computed(() =>
@@ -55,6 +63,7 @@ function persistState() {
   const payload = {
     channelUrls: state.channelUrls,
     progressMap: state.progressMap,
+    playback: state.playback,
   };
   localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
 }
@@ -69,6 +78,11 @@ function loadState() {
     }
     if (parsed.progressMap && typeof parsed.progressMap === "object") {
       state.progressMap = parsed.progressMap;
+    }
+    if (parsed.playback && typeof parsed.playback === "object") {
+      if (Number.isFinite(parsed.playback.volume)) {
+        state.playback.volume = Math.min(Math.max(Number(parsed.playback.volume), 0), 1);
+      }
     }
   } catch (_error) {
     localStorage.removeItem(STORAGE_KEY);
@@ -126,6 +140,8 @@ function switchChannel(channelId) {
 function tryAutoplayCurrent() {
   const video = videoRef.value;
   if (!video || !isPowerOn.value || !currentUrl.value) return;
+  video.volume = state.playback.volume;
+  volumeLevel.value = Math.round(state.playback.volume * 100);
   const playPromise = video.play();
   if (playPromise?.catch) {
     playPromise.catch(() => {});
@@ -139,10 +155,14 @@ function forceSeekToSavedProgress() {
   if (saved <= 0) return;
 
   // 开机兜底：先立即 seek 一次，再在元数据就绪后再 seek 一次，避免回到 00:00。
+  internalSeeking.value = true;
   video.currentTime = saved;
   const onMetadata = () => {
     const maxTime = Number.isFinite(video.duration) ? Math.max(video.duration - 1, 0) : saved;
     video.currentTime = Math.min(saved, maxTime);
+    window.setTimeout(() => {
+      internalSeeking.value = false;
+    }, 0);
   };
   video.addEventListener("loadedmetadata", onMetadata, { once: true });
 }
@@ -177,10 +197,14 @@ function restoreProgressForCurrentChannel() {
   }
   const applyRestore = () => {
     const maxTime = Number.isFinite(video.duration) ? Math.max(video.duration - 1, 0) : saved;
+    internalSeeking.value = true;
     video.currentTime = Math.min(saved, maxTime);
     if (isPowerOn.value) {
       tryAutoplayCurrent();
     }
+    window.setTimeout(() => {
+      internalSeeking.value = false;
+    }, 0);
   };
   if (video.readyState >= 1) {
     applyRestore();
@@ -194,6 +218,46 @@ function onTimeUpdate() {
   if (!video) return;
   state.progressMap[activeChannel.value] = video.currentTime || 0;
   persistState();
+}
+
+function onLoadedMetadata() {
+  const video = videoRef.value;
+  if (!video) return;
+  videoDuration.value = Number.isFinite(video.duration) ? video.duration : 0;
+}
+
+function applyVolume(nextVolume) {
+  const safe = Math.min(Math.max(nextVolume, 0), 1);
+  state.playback.volume = safe;
+  const video = videoRef.value;
+  if (video) {
+    video.volume = safe;
+    video.muted = safe === 0;
+  }
+  volumeLevel.value = Math.round(safe * 100);
+  persistState();
+}
+
+function increaseVolume() {
+  applyVolume(state.playback.volume + 0.1);
+}
+
+function decreaseVolume() {
+  applyVolume(state.playback.volume - 0.1);
+}
+
+function toggleFullscreen() {
+  const frame = screenFrameRef.value;
+  if (!frame) return;
+  if (!document.fullscreenElement) {
+    frame.requestFullscreen?.();
+    return;
+  }
+  document.exitFullscreen?.();
+}
+
+function onFullscreenChange() {
+  isFullscreen.value = Boolean(document.fullscreenElement);
 }
 
 function onVideoEnded() {
@@ -220,12 +284,25 @@ watch(
 
 watch(currentUrl, async () => {
   await nextTick();
+  videoDuration.value = 0;
   restoreProgressForCurrentChannel();
 });
 
+watch(
+  () => state.playback,
+  () => {
+    persistState();
+    applyVolume(state.playback.volume);
+  },
+  { deep: true },
+);
+
 onMounted(() => {
   loadState();
+  volumeLevel.value = Math.round(state.playback.volume * 100);
+  document.addEventListener("fullscreenchange", onFullscreenChange);
   nextTick(() => {
+    applyVolume(state.playback.volume);
     restoreProgressForCurrentChannel();
     tryAutoplayCurrent();
   });
@@ -234,29 +311,26 @@ onMounted(() => {
 
 <template>
   <div class="page">
-    <div class="page-top">
-      <div class="title-wrap">
-        <h1>宝宝老电视乐园</h1>
-        <p>10 个频道，一键切换，继续上次观看进度</p>
-      </div>
-      <a-button class="parent-top-btn" type="primary" @click="openChallenge">家长设置</a-button>
-    </div>
-
-    <div class="tv-shell">
-      <div class="tv-antenna left"></div>
-      <div class="tv-antenna right"></div>
-
-      <div class="screen-frame">
+    <div class="console-layout">
+      <div ref="screenFrameRef" class="screen-frame">
         <template v-if="currentUrl">
           <video
             ref="videoRef"
             class="player"
-            controls
             :autoplay="isPowerOn"
             :src="currentUrl"
             @timeupdate="onTimeUpdate"
+            @loadedmetadata="onLoadedMetadata"
             @ended="onVideoEnded"
           />
+          <div v-if="isPowerOn" class="screen-overlay-controls">
+            <span class="time-chip">
+              {{ formatTime(state.progressMap[activeChannel] || 0) }}/{{ formatTime(videoDuration) }}
+            </span>
+            <button class="fullscreen-chip" type="button" @click="toggleFullscreen">
+              {{ isFullscreen ? "退出全屏" : "全屏" }}
+            </button>
+          </div>
           <div v-if="!isPowerOn" class="off-screen">
             <div>电视已关闭</div>
             <div>打开电源后自动播放当前频道</div>
@@ -268,7 +342,7 @@ onMounted(() => {
         </div>
       </div>
 
-      <div class="tv-right-panel">
+      <aside class="control-panel">
         <div class="power-wrap">
           <span class="power-led" :class="{ on: isPowerOn }"></span>
           <button
@@ -281,6 +355,11 @@ onMounted(() => {
             <span class="power-track"></span>
             <span class="power-thumb"></span>
           </button>
+        </div>
+        <div class="volume-wrap">
+          <button class="volume-btn" type="button" @click="decreaseVolume">-</button>
+          <div class="volume-display">VOL {{ volumeLevel }}</div>
+          <button class="volume-btn" type="button" @click="increaseVolume">+</button>
         </div>
         <div class="channel-board-on-tv">
           <button
@@ -295,7 +374,10 @@ onMounted(() => {
             <span class="progress-tag">{{ formatTime(state.progressMap[item.id] || 0) }}</span>
           </button>
         </div>
-      </div>
+        <button class="parent-icon-btn" type="button" aria-label="家长设置" @click="openChallenge">
+          ⚙
+        </button>
+      </aside>
     </div>
   </div>
 
