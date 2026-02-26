@@ -14,6 +14,7 @@ import { defaultChannelUrls } from "./data/defaultChannels";
 const STORAGE_KEY = "kids-tv-player-state-v2";
 const CHANNEL_COUNT = 10;
 const VIDEO_EXTENSIONS = [".mp4", ".m4v", ".webm", ".mov", ".mkv"];
+const SUBTITLE_EXTENSIONS = [".srt"];
 const LEGO_COLORS = [
   "#ff4d4f",
   "#fa8c16",
@@ -90,6 +91,10 @@ const currentPlaybackTime = computed(() => {
     return Number(currentSeriesMeta.value.currentEpisodeTime || 0);
   }
   return Number(state.progressMap[activeChannel.value] || 0);
+});
+const currentSubtitleUrl = computed(() => {
+  if (!currentSeriesRuntime.value?.episodes?.length) return "";
+  return currentSeriesRuntime.value.episodes[currentEpisodeIndex.value]?.subtitleUrl || "";
 });
 
 const currentEpisodeLabel = computed(() => {
@@ -222,7 +227,12 @@ function verifyChallenge() {
 function releaseSeriesUrls(channelId) {
   const runtime = runtimeSeriesMap[channelId];
   if (!runtime?.episodes?.length) return;
-  runtime.episodes.forEach((episode) => URL.revokeObjectURL(episode.url));
+  runtime.episodes.forEach((episode) => {
+    URL.revokeObjectURL(episode.url);
+    if (episode.subtitleUrl) {
+      URL.revokeObjectURL(episode.subtitleUrl);
+    }
+  });
   delete runtimeSeriesMap[channelId];
 }
 
@@ -240,6 +250,29 @@ function isVideoFile(fileName) {
   return VIDEO_EXTENSIONS.some((ext) => lower.endsWith(ext));
 }
 
+function isSubtitleFile(fileName) {
+  const lower = fileName.toLowerCase();
+  return SUBTITLE_EXTENSIONS.some((ext) => lower.endsWith(ext));
+}
+
+function getFileStem(fileName) {
+  const idx = fileName.lastIndexOf(".");
+  if (idx <= 0) return fileName;
+  return fileName.slice(0, idx);
+}
+
+function normalizeFileStem(fileName) {
+  return getFileStem(fileName).toLowerCase().replace(/\s+/g, "");
+}
+
+function srtToVtt(srtText) {
+  const text = String(srtText || "")
+    .replace(/^\uFEFF/, "")
+    .replace(/\r/g, "")
+    .replace(/(\d{2}:\d{2}:\d{2}),(\d{3})/g, "$1.$2");
+  return `WEBVTT\n\n${text}`;
+}
+
 function naturalNameCompare(a, b) {
   return a.localeCompare(b, "zh-Hans-CN", {
     numeric: true,
@@ -255,15 +288,33 @@ async function bindSeriesFolder(channelId) {
   try {
     const dirHandle = await window.showDirectoryPicker();
 
-    const episodesRaw = [];
+    const videoFiles = [];
+    const subtitleFileMap = new Map();
     for await (const entry of dirHandle.values()) {
       if (entry.kind !== "file") continue;
-      if (!isVideoFile(entry.name)) continue;
       const file = await entry.getFile();
+      if (isVideoFile(entry.name)) {
+        videoFiles.push(file);
+        continue;
+      }
+      if (isSubtitleFile(entry.name)) {
+        subtitleFileMap.set(normalizeFileStem(entry.name), file);
+      }
+    }
+
+    const episodesRaw = [];
+    for (const videoFile of videoFiles) {
+      const subtitleFile = subtitleFileMap.get(normalizeFileStem(videoFile.name));
+      let subtitleUrl = "";
+      if (subtitleFile) {
+        const vttText = srtToVtt(await subtitleFile.text());
+        subtitleUrl = URL.createObjectURL(new Blob([vttText], { type: "text/vtt" }));
+      }
       episodesRaw.push({
-        name: file.name,
-        episodeNo: extractEpisodeNo(file.name),
-        url: URL.createObjectURL(file),
+        name: videoFile.name,
+        episodeNo: extractEpisodeNo(videoFile.name),
+        url: URL.createObjectURL(videoFile),
+        subtitleUrl,
       });
     }
 
@@ -305,8 +356,9 @@ async function bindSeriesFolder(channelId) {
       currentEpisodeTime,
     };
     persistState();
+    const subtitleCount = episodesRaw.filter((item) => item.subtitleUrl).length;
     message.success(
-      `${channelId} 号台已绑定：${dirHandle.name}（${episodeNames.length} 集）`
+      `${channelId} 号台已绑定：${dirHandle.name}（${episodeNames.length} 集，字幕 ${subtitleCount} 集）`
     );
 
     if (channelId === activeChannel.value) {
@@ -626,7 +678,16 @@ onUnmounted(() => {
             @timeupdate="onTimeUpdate"
             @loadedmetadata="onLoadedMetadata"
             @ended="onVideoEnded"
-          />
+          >
+            <track
+              v-if="currentSubtitleUrl"
+              kind="subtitles"
+              srclang="zh"
+              label="中文字幕"
+              :src="currentSubtitleUrl"
+              default
+            />
+          </video>
           <div
             v-if="isPowerOn && !state.playback.bigKidMode"
             class="screen-overlay-controls"
