@@ -109,6 +109,17 @@ body {
   background: radial-gradient(circle, #2f3341 0%, #141823 100%);
 }
 
+.screen-loading {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-content: center;
+  background: rgba(21, 24, 33, 0.85);
+  color: #f0f2f5;
+  font-size: 18px;
+  z-index: 2;
+}
+
 .control-panel {
   border-radius: 14px;
   background: linear-gradient(180deg, #ffd666 0%, #f6bf3d 100%);
@@ -342,6 +353,70 @@ body {
 .series-meta {
   color: #595959;
   font-size: 12px;
+}
+
+.baidu-toolbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.baidu-path {
+  flex: 1;
+  color: #595959;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.baidu-error {
+  color: #cf1322;
+  margin-bottom: 10px;
+}
+
+.baidu-list {
+  max-height: 420px;
+  overflow: auto;
+  border: 1px solid #f0f0f0;
+  border-radius: 10px;
+}
+
+.baidu-item {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+  border-bottom: 1px solid #f0f0f0;
+  cursor: pointer;
+}
+
+.baidu-item-left {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  min-width: 0;
+}
+
+.baidu-icon {
+  width: 18px;
+  text-align: center;
+}
+
+.baidu-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.baidu-item-right {
+  color: #8c8c8c;
+  font-size: 12px;
+}
+
+.baidu-empty {
+  padding: 12px;
+  color: #8c8c8c;
 }
 
 .setting-label {
